@@ -105,7 +105,13 @@ OSNotificationOpenedResult* coldStartOSNotificationOpenedResult;
                                                          options:NSJSONReadingMutableContainers
                                                            error:&jsonError];
     
-    [curRCTBridge.eventDispatcher sendAppEventWithName:@"remoteNotificationOpened" body:json];
+    // Opened callback will never be called due to race condition unless at short delay...
+    // https://github.com/geektimecoil/react-native-onesignal/issues/279
+    dispatch_time_t delay = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC));
+    dispatch_after(delay, dispatch_get_main_queue(), ^(void){
+        [curRCTBridge.eventDispatcher sendAppEventWithName:@"remoteNotificationOpened" body:json];
+    });
+    
 }
 
 - (void)handleRemoteNotificationsRegistered:(NSNotification *)notification {
