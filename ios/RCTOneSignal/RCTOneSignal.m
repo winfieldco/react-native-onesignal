@@ -11,6 +11,7 @@
 #endif
 
 #import "RCTOneSignal.h"
+#import "RCTOneSignalEventEmitter.h"
 
 #if __IPHONE_OS_VERSION_MIN_REQUIRED < __IPHONE_8_0
 
@@ -25,218 +26,136 @@
 @interface RCTOneSignal ()
 @end
 
-@implementation RCTOneSignal
-
-@synthesize bridge = _bridge;
-
-RCT_EXPORT_MODULE(RCTOneSignal)
-
-static RCTBridge *curRCTBridge;
+@implementation RCTOneSignal {
+    BOOL didInitialize;
+}
 
 OSNotificationOpenedResult* coldStartOSNotificationOpenedResult;
 
-- (void)setBridge:(RCTBridge *)receivedBridge {
-    _bridge = receivedBridge;
-    curRCTBridge = receivedBridge;
++ (RCTOneSignal *) sharedInstance {
+    static dispatch_once_t token = 0;
+    static id _sharedInstance = nil;
+    dispatch_once(&token, ^{
+        _sharedInstance = [[RCTOneSignal alloc] init];
+    });
+    return _sharedInstance;
+}
+
+- (void)initOneSignal {
+    [OneSignal setValue:@"react" forKey:@"mSDKType"];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(didBeginObserving) name:@"didSetBridge" object:nil];
     
-    if (coldStartOSNotificationOpenedResult) {
-        [self handleRemoteNotificationOpened:[coldStartOSNotificationOpenedResult stringify]];
-        coldStartOSNotificationOpenedResult = nil;
-    }
+    [OneSignal initWithLaunchOptions:nil appId:nil handleNotificationReceived:^(OSNotification* notification) {
+        [self handleRemoteNotificationReceived:[notification stringify]];
+    } handleNotificationAction:^(OSNotificationOpenedResult *result) {
+        if (!RCTOneSignal.sharedInstance.didStartObserving)
+            coldStartOSNotificationOpenedResult = result;
+        else
+            [self handleRemoteNotificationOpened:[result stringify]];
+        
+    } settings:@{@"kOSSettingsKeyInOmitNoAppIdLogging" : @true, kOSSettingsKeyAutoPrompt : @false}]; //default autoPrompt to false since init will be called again
+    didInitialize = false;
+}
+
+// deprecated init methods
+// provides backwards compatibility
+- (id)initWithLaunchOptions:(NSDictionary *)launchOptions appId:(NSString *)appId {
+    return [self initWithLaunchOptions:launchOptions appId:appId settings:nil];
+}
+
+- (id)initWithLaunchOptions:(NSDictionary *)launchOptions appId:(NSString *)appId settings:(NSDictionary*)settings {
+    [self configureWithAppId:appId settings:settings];
+    
+    return self;
+}
+
+- (void)didBeginObserving {
+    // To continue supporting deprecated initialization methods (which create a new RCTOneSignal instance),
+    // we will only access the didStartObserving property of the shared instance to avoid issues
+    RCTOneSignal.sharedInstance.didStartObserving = true;
+    
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (coldStartOSNotificationOpenedResult) {
+            [self handleRemoteNotificationOpened:[coldStartOSNotificationOpenedResult stringify]];
+            coldStartOSNotificationOpenedResult = nil;
+        }
+    });
 }
 
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
-- (id)initWithLaunchOptions:(NSDictionary *)launchOptions appId:(NSString *)appId {
-    return [self initWithLaunchOptions:launchOptions appId:appId settings:nil];
+- (void)configureWithAppId:(NSString *)appId {
+    [self configureWithAppId:appId settings:nil];
 }
 
-- (id)initWithLaunchOptions:(NSDictionary *)launchOptions appId:(NSString *)appId settings:(NSDictionary*)settings {
+- (void)configureWithAppId:(NSString *)appId settings:(NSDictionary*)settings {
+    
+    if (didInitialize)
+        return;
+    
+    didInitialize = true;
     [OneSignal addSubscriptionObserver:self];
-    [OneSignal setValue:@"react" forKey:@"mSDKType"];
-    [OneSignal initWithLaunchOptions:launchOptions
+    [OneSignal addEmailSubscriptionObserver:self];
+    [OneSignal initWithLaunchOptions:nil
                                appId:appId
           handleNotificationReceived:^(OSNotification* notification) {
               [self handleRemoteNotificationReceived:[notification stringify]];
           }
           handleNotificationAction:^(OSNotificationOpenedResult *result) {
-              if (!curRCTBridge)
+              if (!RCTOneSignal.sharedInstance.didStartObserving)
                   coldStartOSNotificationOpenedResult = result;
               else
                   [self handleRemoteNotificationOpened:[result stringify]];
+              
           }
           settings:settings];
+}
 
-    return self;
+-(void)onOSEmailSubscriptionChanged:(OSEmailSubscriptionStateChanges *)stateChanges {
+    [self sendEvent:OSEventString(EmailSubscriptionChanged) withBody:stateChanges.to.toDictionary];
 }
 
 - (void)onOSSubscriptionChanged:(OSSubscriptionStateChanges*)stateChanges {
     
     // Example of detecting subscribing to OneSignal
     if (!stateChanges.from.subscribed && stateChanges.to.subscribed) {
-        NSLog(@"Subscribed for OneSignal push notifications!");
+        //Subscribed for OneSignal push notifications!
     }
     
-    // prints out all properties
-    NSLog(@"SubscriptionStateChanges:\n%@", stateChanges.to);
-    [self.bridge.eventDispatcher sendAppEventWithName:@"idsAvailable" body:stateChanges.to];
+    [self sendEvent:OSEventString(IdsAvailable) withBody:stateChanges.to.toDictionary];
 }
 
 - (void)handleRemoteNotificationReceived:(NSString *)notification {
+    NSDictionary *json = [self jsonObjectWithString:notification];
     
-    NSError *jsonError;
-    NSData *objectData = [notification dataUsingEncoding:NSUTF8StringEncoding];
-    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:objectData
-                                                         options:NSJSONReadingMutableContainers
-                                                           error:&jsonError];
-
-    
-    
-    [curRCTBridge.eventDispatcher sendAppEventWithName:@"remoteNotificationReceived" body:json];
+    if (json)
+        [self sendEvent:OSEventString(NotificationReceived) withBody:json];
 }
 
 - (void)handleRemoteNotificationOpened:(NSString *)result {
+    NSDictionary *json = [self jsonObjectWithString:result];
     
+    if (json)
+        [self sendEvent:OSEventString(NotificationOpened) withBody:json];
+}
+
+- (NSDictionary *)jsonObjectWithString:(NSString *)jsonString {
     NSError *jsonError;
-    NSData *objectData = [result dataUsingEncoding:NSUTF8StringEncoding];
-    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:objectData
-                                                         options:NSJSONReadingMutableContainers
-                                                           error:&jsonError];
+    NSData *data = [jsonString dataUsingEncoding:NSUTF8StringEncoding];
+    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:&jsonError];
     
-    // Opened callback will never be called due to race condition unless at short delay...
-    // https://github.com/geektimecoil/react-native-onesignal/issues/279
-    dispatch_time_t delay = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC));
-    dispatch_after(delay, dispatch_get_main_queue(), ^(void){
-        [curRCTBridge.eventDispatcher sendAppEventWithName:@"remoteNotificationOpened" body:json];
-    });
-    
-}
-
-- (void)handleRemoteNotificationsRegistered:(NSNotification *)notification {
-    [self.bridge.eventDispatcher sendAppEventWithName:@"remoteNotificationsRegistered" body:notification.userInfo];
-}
-
-RCT_EXPORT_METHOD(checkPermissions:(RCTResponseSenderBlock)callback)
-{
-    if (RCTRunningInAppExtension()) {
-        callback(@[@{@"alert": @NO, @"badge": @NO, @"sound": @NO}]);
-        return;
+    if (jsonError) {
+        [OneSignal onesignal_Log:ONE_S_LL_ERROR message:[NSString stringWithFormat:@"Unable to serialize JSON string into an object: %@", jsonError]];
+        return nil;
     }
     
-    NSUInteger types = 0;
-    if ([UIApplication instancesRespondToSelector:@selector(currentUserNotificationSettings)]) {
-        types = [RCTSharedApplication() currentUserNotificationSettings].types;
-    } else {
-        
-#if __IPHONE_OS_VERSION_MIN_REQUIRED < __IPHONE_8_0
-        types = [RCTSharedApplication() enabledRemoteNotificationTypes];
-#endif
-        
-    }
-    
-    callback(@[@{
-                   @"alert": @((types & UIUserNotificationTypeAlert) > 0),
-                   @"badge": @((types & UIUserNotificationTypeBadge) > 0),
-                   @"sound": @((types & UIUserNotificationTypeSound) > 0),
-                   }]);
+    return json;
 }
 
-RCT_EXPORT_METHOD(requestPermissions:(NSDictionary *)permissions) {
-    if (RCTRunningInAppExtension()) {
-        return;
-    }
-
-    UIUserNotificationType types = UIUserNotificationTypeNone;
-    if (permissions) {
-        if ([RCTConvert BOOL:permissions[@"alert"]]) {
-            types |= UIUserNotificationTypeAlert;
-        }
-        if ([RCTConvert BOOL:permissions[@"badge"]]) {
-            types |= UIUserNotificationTypeBadge;
-        }
-        if ([RCTConvert BOOL:permissions[@"sound"]]) {
-            types |= UIUserNotificationTypeSound;
-        }
-    } else {
-        types = UIUserNotificationTypeAlert | UIUserNotificationTypeBadge | UIUserNotificationTypeSound;
-    }
-
-    UIApplication *app = RCTSharedApplication();
-    if ([app respondsToSelector:@selector(registerUserNotificationSettings:)]) {
-        UIUserNotificationSettings *notificationSettings =
-        [UIUserNotificationSettings settingsForTypes:(NSUInteger)types categories:nil];
-        [app registerUserNotificationSettings:notificationSettings];
-        [app registerForRemoteNotifications];
-    } else {
-        [app registerForRemoteNotificationTypes:(NSUInteger)types];
-    }
-}
-
-RCT_EXPORT_METHOD(registerForPushNotifications) {
-    [OneSignal registerForPushNotifications];
-}
-
-RCT_EXPORT_METHOD(sendTag:(NSString *)key value:(NSString*)value) {
-    [OneSignal sendTag:key value:value];
-}
-
-RCT_EXPORT_METHOD(configure) {
-    [OneSignal IdsAvailable:^(NSString* userId, NSString* pushToken) {
-
-        NSDictionary *params = @{
-          @"pushToken": pushToken ?: [NSNull null],
-          @"userId" : userId ?: [NSNull null]
-        };
-
-        [self.bridge.eventDispatcher sendAppEventWithName:@"idsAvailable" body:params];
-    }];
-}
-
-RCT_EXPORT_METHOD(sendTags:(NSDictionary *)properties) {
-    [OneSignal sendTags:properties onSuccess:^(NSDictionary *sucess) {
-        NSLog(@"Send Tags Success");
-    } onFailure:^(NSError *error) {
-        NSLog(@"Send Tags Failure");
-    }];}
-
-RCT_EXPORT_METHOD(getTags:(RCTResponseSenderBlock)callback) {
-    [OneSignal getTags:^(NSDictionary *tags) {
-        NSLog(@"Get Tags Success");
-        callback(@[tags]);
-    } onFailure:^(NSError *error) {
-        NSLog(@"Get Tags Failure");
-        callback(@[error]);
-    }];
-}
-
-RCT_EXPORT_METHOD(deleteTag:(NSString *)key) {
-    [OneSignal deleteTag:key];
-}
-
-RCT_EXPORT_METHOD(setSubscription:(BOOL)enable) {
-    [OneSignal setSubscription:enable];
-}
-
-RCT_EXPORT_METHOD(promptLocation) {
-    [OneSignal promptLocation];
-}
-
-RCT_EXPORT_METHOD(postNotification:(NSDictionary *)contents data:(NSDictionary *)data player_id:(NSString*)player_id) {
-    [OneSignal postNotification:@{
-                                  @"contents" : contents,
-                                  @"data" : @{@"p2p_notification": data},
-                                  @"include_player_ids": @[player_id]
-                                  }];
-}
-
-RCT_EXPORT_METHOD(syncHashedEmail:(NSString*)email) {
-    [OneSignal syncHashedEmail:email];
-}
-
-RCT_EXPORT_METHOD(setLogLevel:(ONE_S_LOG_LEVEL)logLevel visualLogLevel:(ONE_S_LOG_LEVEL)visualLogLevel) {
-    [OneSignal setLogLevel:logLevel visualLevel:visualLogLevel];
+- (void)sendEvent:(NSString *)eventName withBody:(NSDictionary *)body {
+    [RCTOneSignalEventEmitter sendEventWithName:eventName withBody:body];
 }
 
 @end
