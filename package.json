@@ -1,6 +1,6 @@
 {
   "name": "react-native-onesignal",
-  "version": "3.0.4-post10",
+  "version": "3.0.4-post11",
   "description": "React Native OneSignal Component",
   "main": "index",
   "scripts": {
