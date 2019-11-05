@@ -1,23 +1,42 @@
 
 'use strict';
 
-import { NativeModules, NativeEventEmitter, NetInfo, Platform } from 'react-native';
+import { NativeModules, NativeEventEmitter, Platform } from 'react-native';
 import invariant from 'invariant';
 
 const RNOneSignal = NativeModules.OneSignal;
 
+const OS_REMOTE_NOTIFICATION_RECEIVED = 'OneSignal-remoteNotificationReceived';
+const OS_REMOTE_NOTIFICATION_OPENED = 'OneSignal-remoteNotificationOpened';
+const OS_IDS_AVAILABLE = 'OneSignal-idsAvailable';
+const OS_EMAIL_SUBSCRIPTION = 'OneSignal-emailSubscription';
+const OS_IN_APP_MESSAGE_CLICKED = 'OneSignal-inAppMessageClicked';
+
 const eventBroadcastNames = [
-    'OneSignal-remoteNotificationReceived',
-    'OneSignal-remoteNotificationOpened',
-    'OneSignal-idsAvailable',
-    'OneSignal-emailSubscription'
+    OS_REMOTE_NOTIFICATION_RECEIVED,
+    OS_REMOTE_NOTIFICATION_OPENED,
+    OS_IDS_AVAILABLE,
+    OS_EMAIL_SUBSCRIPTION,
+    OS_IN_APP_MESSAGE_CLICKED
+];
+
+const NOTIFICATION_RECEIVED_EVENT = "received";
+const NOTIFICATION_OPENED_EVENT = "opened";
+const IDS_AVAILABLE_EVENT = "ids";
+const EMAIL_SUBSCRIPTION_EVENT = "emailSubscription";
+const IN_APP_MESSAGE_CLICKED_EVENT = "inAppMessageClicked";
+
+const _eventNames = [
+    NOTIFICATION_RECEIVED_EVENT,
+    NOTIFICATION_OPENED_EVENT,
+    IDS_AVAILABLE_EVENT,
+    EMAIL_SUBSCRIPTION_EVENT,
+    IN_APP_MESSAGE_CLICKED_EVENT
 ];
 
 var oneSignalEventEmitter;
 
-var _eventNames = [ "received", "opened", "ids", "emailSubscription"];
-
-var _notificationHandler = new Map();
+var _eventTypeHandler = new Map();
 var _notificationCache = new Map();
 var _listeners = [];
 
@@ -37,7 +56,7 @@ function handleEventBroadcast(type, broadcast) {
         broadcast, (notification) => {
             // Check if we have added listener for this type yet
             // Cache the result first if we have not.
-            var handler = _notificationHandler.get(type);
+            var handler = _eventTypeHandler.get(type);
 
             if (handler) {
                 handler(notification);
@@ -56,17 +75,34 @@ export default class OneSignal {
     static addEventListener(type, handler) {
         if (!checkIfInitialized()) return;
 
-        // Listen to events of notification received, opened, device registered and IDSAvailable.
+        // Listen to events of notification received, opened, device registered, IDSAvailable, and IAMClicked.
 
         invariant(
-            type === 'received' || type === 'opened' || type === 'ids' || type == 'emailSubscription',
-            'OneSignal only supports `received`, `opened`, and `ids` events'
+            type === NOTIFICATION_RECEIVED_EVENT ||
+            type === NOTIFICATION_OPENED_EVENT ||
+            type === IDS_AVAILABLE_EVENT ||
+            type === EMAIL_SUBSCRIPTION_EVENT ||
+            type === IN_APP_MESSAGE_CLICKED_EVENT,
+            'OneSignal only supports `received`, `opened`, `ids`, `emailSubscription`, and `inAppMessageClicked` events'
         );
 
-        _notificationHandler.set(type, handler);
+        _eventTypeHandler.set(type, handler);
 
-        if (type == 'opened') {
-            RNOneSignal.didSetNotificationOpenedHandler();
+        if (type === NOTIFICATION_OPENED_EVENT) {
+            RNOneSignal.initNotificationOpenedHandlerParams();
+        }
+
+        // triggers ids event
+        if (type === IDS_AVAILABLE_EVENT) {
+            RNOneSignal.idsAvailable();
+        }
+
+        if (type === IN_APP_MESSAGE_CLICKED_EVENT) {
+            if (Platform.OS === 'android') {
+                RNOneSignal.initInAppMessageClickHandlerParams();
+            } else if (Platform.OS === 'ios') {
+                RNOneSignal.setInAppMessageClickHandler();
+            }
         }
 
         // Check if there is a cache for this type of event
@@ -77,15 +113,19 @@ export default class OneSignal {
         }
     }
 
-    static removeEventListener(type, handler) {
+    static removeEventListener(type) {
         if (!checkIfInitialized()) return;
 
         invariant(
-            type === 'received' || type === 'opened' || type === 'ids' || type == 'emailSubscription',
-            'OneSignal only supports `received`, `opened`, and `ids` events'
+            type === NOTIFICATION_RECEIVED_EVENT ||
+            type === NOTIFICATION_OPENED_EVENT ||
+            type === IDS_AVAILABLE_EVENT ||
+            type === EMAIL_SUBSCRIPTION_EVENT ||
+            type === IN_APP_MESSAGE_CLICKED_EVENT,
+            'OneSignal only supports `received`, `opened`, `ids`, `emailSubscription`, and `inAppMessageClicked` events'
         );
 
-        _notificationHandler.delete(type);
+        _eventTypeHandler.delete(type);
     }
 
     static clearListeners() {
@@ -144,16 +184,15 @@ export default class OneSignal {
         }
     }
 
+    /* deprecated */
     static configure() {
-        if (!checkIfInitialized()) return;
-
-        RNOneSignal.configure();
+        console.warn("OneSignal: the `configure` method has been deprecated. The `ids` event is now triggered automatically.");
     }
 
     static init(appId, iOSSettings) {
         if (!checkIfInitialized()) return;
 
-        if (Platform.OS == 'ios') {
+        if (Platform.OS === 'ios') {
             RNOneSignal.initWithAppId(appId, iOSSettings);
         } else {
             RNOneSignal.init(appId);
@@ -197,11 +236,21 @@ export default class OneSignal {
     static sendTag(key, value) {
         if (!checkIfInitialized()) return;
 
+        if (typeof value === "boolean") {
+            value = value.toString();
+        }
+
         RNOneSignal.sendTag(key, value);
     }
 
     static sendTags(tags) {
         if (!checkIfInitialized()) return;
+
+        Object.keys(tags).forEach((key)=>{
+            if (typeof tags[key] === "boolean"){
+                tags[key] = tags[key].toString();
+            }
+        })
 
         RNOneSignal.sendTags(tags || {});
     }
@@ -371,5 +420,103 @@ export default class OneSignal {
         if (!checkIfInitialized()) return;
 
         RNOneSignal.removeExternalUserId();
+    }
+
+    /**
+     * In-App Messaging
+     */
+
+    // Pass a String key and any value and creates a trigger map to pass to addTriggers()
+    static addTrigger(key, value) {
+        if (!checkIfInitialized()) return;
+
+        var trigger = {};
+        trigger[key] = value;
+        RNOneSignal.addTriggers(trigger);
+    }
+
+
+    // Expected format is Map<String, Object>, make sure all values are Objects and keys are Strings
+    static addTriggers(triggers) {
+        if (!checkIfInitialized()) return;
+
+        RNOneSignal.addTriggers(triggers);
+    }
+
+    static removeTriggersForKeys(keys) {
+        if (!checkIfInitialized()) return;
+
+        RNOneSignal.removeTriggersForKeys(keys);
+    }
+
+    static removeTriggerForKey(key) {
+        if (!checkIfInitialized()) return;
+
+        RNOneSignal.removeTriggerForKey(key);
+    }
+
+    static getTriggerValueForKey(key) {
+        // must return a promise
+        if (!checkIfInitialized()) return Promise.resolve();
+
+        return RNOneSignal.getTriggerValueForKey(key);
+    }
+
+    static pauseInAppMessages(pause) {
+        if (!checkIfInitialized()) return;
+
+        RNOneSignal.pauseInAppMessages(pause);
+    }
+
+    /**
+     * Outcomes
+     */
+
+    static sendOutcome(name, callback=()=>{}) {
+        if (!checkIfInitialized()) return;
+
+        if (Platform.OS === "ios") {
+            console.warn("OneSignal.sendOutcome is not yet supported on iOS");
+            return;
+        }
+
+        invariant(
+            typeof callback === 'function',
+            'Must provide a valid callback'
+        );
+
+        RNOneSignal.sendOutcome(name, callback);
+    }
+
+    static sendUniqueOutcome(name, callback=()=>{}) {
+        if (!checkIfInitialized()) return;
+
+        if (Platform.OS === "ios") {
+            console.warn("OneSignal.sendUniqueOutcome is not yet supported on iOS");
+            return;
+        }
+
+        invariant(
+            typeof callback === 'function',
+            'Must provide a valid callback'
+        );
+
+        RNOneSignal.sendUniqueOutcome(name, callback);
+    }
+
+    static sendOutcomeWithValue(name, value, callback=()=>{}) {
+        if (!checkIfInitialized()) return;
+
+        if (Platform.OS === "ios") {
+            console.warn("OneSignal.sendOutcomeWithValue is not yet supported on iOS");
+            return;
+        }
+
+        invariant(
+            typeof callback === 'function',
+            'Must provide a valid callback'
+        );
+
+        RNOneSignal.sendOutcomeWithValue(name, Number(value), callback);
     }
 }
